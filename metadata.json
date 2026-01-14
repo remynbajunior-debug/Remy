@@ -1,0 +1,7 @@
+{
+  "name": "NBA Live Stats & Voice",
+  "description": "Monitoramento em tempo real de jogos da NBA com destaques de jogadores e assistente de voz conversacional.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
