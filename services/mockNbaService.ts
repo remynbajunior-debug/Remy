@@ -1,213 +1,275 @@
 import { Game, Player } from '../types';
 
-// Endpoints públicos da ESPN
-const SCOREBOARD_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard';
-const SUMMARY_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary';
+// --- SOURCES ---
+// We use a CORS proxy to access NBA CDN data from the browser
+const PROXY_URL = 'https://corsproxy.io/?';
 
-// --- Types ---
-interface EspnCompetitor {
-  id: string;
-  team: {
-    id: string;
-    abbreviation: string;
-    displayName: string;
-    color?: string;
-    logo?: string;
-  };
-  score: string;
-  homeAway: string;
-}
+// 1. NBA CDN (Primary - Faster, official data)
+const NBA_CDN_SCOREBOARD = 'https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json';
+const NBA_CDN_BOXSCORE_BASE = 'https://cdn.nba.com/static/json/liveData/boxscore/boxscore_'; // append gameId + .json
 
-interface EspnEvent {
-  id: string;
-  date: string; 
-  status: {
-    type: {
-      state: string; // "pre", "in", "post"
-      detail: string; // "Final", "Q4 - 5:00"
-    };
-    period: number;
-    displayClock: string;
-  };
-  competitions:Array<{
-    competitors: EspnCompetitor[];
-  }>;
-}
+// 2. ESPN API (Fallback)
+const ESPN_SCOREBOARD_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard';
+const ESPN_SUMMARY_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary';
 
-// --- HELPER FUNCTIONS ---
+// --- HELPERS ---
+
+const parseMinutes = (minStr: string): number => {
+  if (!minStr) return 0;
+  // NBA CDN format: "PT12M34.00S" or "12:34"
+  let clean = minStr.replace('PT', '').replace('S', '');
+  
+  if (clean.includes('M')) {
+    const parts = clean.split('M');
+    const m = parseInt(parts[0]);
+    const s = parseFloat(parts[1] || '0');
+    return m + (s / 60);
+  }
+
+  if (clean.includes(':')) {
+    const parts = clean.split(':');
+    return parseInt(parts[0]) + parseFloat(parts[1]) / 60;
+  }
+  
+  return parseFloat(clean) || 0;
+};
 
 const getTeamColor = (abbr: string): string => {
   const colors: Record<string, string> = {
     LAL: 'text-yellow-400', BOS: 'text-green-500', GSW: 'text-blue-400', MIA: 'text-red-500',
     CHI: 'text-red-600', BKN: 'text-white', NYK: 'text-orange-500', PHI: 'text-blue-600',
     DEN: 'text-yellow-300', DAL: 'text-blue-500', MIL: 'text-green-600', PHX: 'text-orange-400',
-    ATL: 'text-red-500', MIN: 'text-blue-300', NOP: 'text-indigo-400', UTA: 'text-yellow-200'
+    ATL: 'text-red-500', MIN: 'text-blue-300', NOP: 'text-indigo-400', UTA: 'text-yellow-200',
+    OKC: 'text-blue-400', CLE: 'text-red-700', IND: 'text-yellow-500', HOU: 'text-red-600',
+    SAS: 'text-slate-300', SAC: 'text-purple-500', TOR: 'text-red-600', ORL: 'text-blue-500',
+    WAS: 'text-red-500', DET: 'text-red-600', CHA: 'text-teal-400', MEM: 'text-blue-300',
+    POR: 'text-red-500', LAC: 'text-blue-500'
   };
   return colors[abbr] || 'text-slate-200';
 };
 
-const getYyyyMmDd = (date: Date) => {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}${month}${day}`;
-};
+// --- NBA CDN FETCHING ---
 
-const calculateElapsedMinutes = (quarter: number, clock: string, status: string): number => {
-  if (status === 'FINISHED') return 48;
-  if (status === 'SCHEDULED' || status === 'pre') return 0;
-  
-  // clock format usually "11:30" or "45.2" (seconds)
-  let minutesLeftInQuarter = 0;
-  if (clock) {
-    const parts = clock.split(':');
-    if (parts.length === 2) {
-      minutesLeftInQuarter = parseInt(parts[0]) + parseInt(parts[1]) / 60;
-    } else if (parts.length === 1 && clock.trim() !== '') {
-      minutesLeftInQuarter = parseFloat(parts[0]) / 60;
-    }
-  }
-
-  // NBA quarters are 12 mins
-  // Q1 start: q=1, left=12 -> elapsed=0
-  // Q1 end: q=1, left=0 -> elapsed=12
-  // Q2 start: q=2, left=12 -> elapsed=12
-  const pastQuarters = (quarter - 1) * 12;
-  const currentQuarterElapsed = 12 - minutesLeftInQuarter;
-  
-  // Clamp between 0 and 48 (exclude OT logic for simplicity or cap at actual time)
-  return Math.max(0.1, pastQuarters + currentQuarterElapsed); // Min 0.1 to avoid division by zero
-};
-
-// --- API FETCHING ---
-
-export const fetchLiveNbaData = async (apiKey?: string): Promise<{ games: Game[], players: Player[], error?: string }> => {
+async function fetchFromNbaCdn(): Promise<{ games: Game[], players: Player[] } | null> {
   try {
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
+    // Use CORS proxy
+    const targetUrl = encodeURIComponent(NBA_CDN_SCOREBOARD);
+    const res = await fetch(`${PROXY_URL}${targetUrl}`);
+    
+    if (!res.ok) throw new Error(`NBA CDN Scoreboard failed: ${res.status}`);
+    const data = await res.json();
+    
+    const gamesData = data.scoreboard?.games || [];
+    const games: Game[] = [];
+    const players: Player[] = [];
 
-    // 1. Fetch Scoreboard for Yesterday AND Today
-    const [resToday, resYesterday] = await Promise.all([
-      fetch(`${SCOREBOARD_URL}?dates=${getYyyyMmDd(today)}&limit=100`),
-      fetch(`${SCOREBOARD_URL}?dates=${getYyyyMmDd(yesterday)}&limit=100`)
-    ]);
+    for (const g of gamesData) {
+      // NBA Game Status: 1=Scheduled, 2=Live, 3=Final
+      let status: 'SCHEDULED' | 'LIVE' | 'FINISHED' = 'SCHEDULED';
+      if (g.gameStatus === 2) status = 'LIVE';
+      if (g.gameStatus === 3) status = 'FINISHED';
 
-    const dataToday = resToday.ok ? await resToday.json() : { events: [] };
-    const dataYesterday = resYesterday.ok ? await resYesterday.json() : { events: [] };
-
-    const allEvents: EspnEvent[] = [...(dataToday.events || []), ...(dataYesterday.events || [])];
-    const uniqueEventsMap = new Map<string, EspnEvent>();
-    allEvents.forEach(evt => uniqueEventsMap.set(evt.id, evt));
-    const uniqueEvents = Array.from(uniqueEventsMap.values());
-
-    const games: Game[] = uniqueEvents.map(evt => {
-      const comp = evt.competitions[0];
-      const home = comp.competitors.find(c => c.homeAway === 'home');
-      const away = comp.competitors.find(c => c.homeAway === 'away');
+      // Parse Period/Clock
+      const quarter = g.period;
+      const clock = g.gameClock || ""; // "PT05M30.00S"
       
-      const statusState = evt.status.type.state; 
-      let appStatus: 'SCHEDULED' | 'LIVE' | 'FINISHED' = 'SCHEDULED';
-      if (statusState === 'in') appStatus = 'LIVE';
-      if (statusState === 'post') appStatus = 'FINISHED';
+      // Calculate elapsed (rough approximation for game list)
+      let elapsed = 0;
+      if (status === 'FINISHED') elapsed = 48;
+      else if (status === 'LIVE') {
+        const qElapsed = 12 - parseMinutes(clock);
+        elapsed = ((quarter - 1) * 12) + Math.max(0, qElapsed);
+      }
 
-      // Calculate elapsed time for pace stats
-      const elapsed = calculateElapsedMinutes(evt.status.period, evt.status.displayClock, appStatus);
+      games.push({
+        id: g.gameId,
+        quarter: quarter,
+        timeLeft: clock.replace('PT', '').replace('M', ':').replace('S', '').split('.')[0], 
+        elapsedMinutes: elapsed,
+        status: status,
+        homeTeam: {
+          id: g.homeTeam.teamId,
+          name: g.homeTeam.teamName,
+          abbreviation: g.homeTeam.teamTricode,
+          score: g.homeTeam.score,
+          color: getTeamColor(g.homeTeam.teamTricode),
+          logo: `https://cdn.nba.com/logos/nba/${g.homeTeam.teamId}/primary/L/logo.svg`
+        },
+        awayTeam: {
+          id: g.awayTeam.teamId,
+          name: g.awayTeam.teamName,
+          abbreviation: g.awayTeam.teamTricode,
+          score: g.awayTeam.score,
+          color: getTeamColor(g.awayTeam.teamTricode),
+          logo: `https://cdn.nba.com/logos/nba/${g.awayTeam.teamId}/primary/L/logo.svg`
+        }
+      });
 
+      // If LIVE or FINISHED, fetch boxscore
+      if (status !== 'SCHEDULED') {
+        try {
+          const boxUrl = encodeURIComponent(`${NBA_CDN_BOXSCORE_BASE}${g.gameId}.json`);
+          const boxRes = await fetch(`${PROXY_URL}${boxUrl}`);
+          
+          if (boxRes.ok) {
+            const boxData = await boxRes.json();
+            const processTeam = (teamData: any) => {
+              if (!teamData?.players) return;
+              teamData.players.forEach((p: any) => {
+                 if (p.status === 'ACTIVE' && p.statistics && p.statistics.minutes) {
+                   const mins = parseMinutes(p.statistics.minutes);
+                   // Include even low minute players
+                   if (mins > 0.1) { 
+                     players.push({
+                       id: String(p.personId),
+                       name: `${p.firstName} ${p.familyName}`,
+                       teamId: `t_${teamData.teamTricode}`,
+                       gameId: g.gameId,
+                       position: p.position,
+                       avatar: `https://cdn.nba.com/headshots/nba/latest/1040x760/${p.personId}.png`,
+                       stats: {
+                         pts: p.statistics.points,
+                         reb: p.statistics.reboundsTotal,
+                         ast: p.statistics.assists,
+                         stl: p.statistics.steals || 0,
+                         blk: p.statistics.blocks || 0,
+                         fgm: p.statistics.fieldGoalsMade,
+                         fga: p.statistics.fieldGoalsAttempted,
+                         minutes: mins
+                       },
+                       averages: {
+                         pts: p.statistics.threePointersMade, // Storing 3PM here for compatibility
+                         reb: 0,
+                         ast: 0
+                       }
+                     });
+                   }
+                 }
+              });
+            };
+            processTeam(boxData.game.homeTeam);
+            processTeam(boxData.game.awayTeam);
+          }
+        } catch (e) {
+          console.warn(`Failed to fetch boxscore for ${g.gameId}`, e);
+        }
+      }
+    }
+    
+    return { games, players };
+
+  } catch (e) {
+    console.warn("NBA CDN Fetch via Proxy failed, switching to ESPN...", e);
+    return null; // Trigger fallback
+  }
+}
+
+// --- ESPN FETCHING (FALLBACK) ---
+
+async function fetchFromEspn(): Promise<{ games: Game[], players: Player[] }> {
+  try {
+    const res = await fetch(`${ESPN_SCOREBOARD_URL}?limit=100`);
+    if (!res.ok) throw new Error("ESPN Scoreboard failed");
+    const data = await res.json();
+    const events = data.events || [];
+    
+    const games: Game[] = events.map((evt: any) => {
+      const comp = evt.competitions[0];
+      const home = comp.competitors.find((c: any) => c.homeAway === 'home');
+      const away = comp.competitors.find((c: any) => c.homeAway === 'away');
+      const state = evt.status.type.state;
+      
       return {
         id: evt.id,
         quarter: evt.status.period,
         timeLeft: evt.status.displayClock,
-        elapsedMinutes: elapsed,
-        status: appStatus,
+        elapsedMinutes: evt.status.period * 12, // Rough estimate
+        status: state === 'in' ? 'LIVE' : state === 'post' ? 'FINISHED' : 'SCHEDULED',
         homeTeam: {
-          id: home?.team.id || '0',
-          name: home?.team.displayName || 'Home',
-          abbreviation: home?.team.abbreviation || 'HOM',
-          score: parseInt(home?.score || '0'),
-          color: getTeamColor(home?.team.abbreviation || ''),
-          logo: home?.team.logo || ''
+          id: home.team.id,
+          name: home.team.displayName,
+          abbreviation: home.team.abbreviation,
+          score: parseInt(home.score),
+          color: getTeamColor(home.team.abbreviation),
+          logo: home.team.logo
         },
         awayTeam: {
-          id: away?.team.id || '0',
-          name: away?.team.displayName || 'Away',
-          abbreviation: away?.team.abbreviation || 'AWY',
-          score: parseInt(away?.score || '0'),
-          color: getTeamColor(away?.team.abbreviation || ''),
-          logo: away?.team.logo || ''
+          id: away.team.id,
+          name: away.team.displayName,
+          abbreviation: away.team.abbreviation,
+          score: parseInt(away.score),
+          color: getTeamColor(away.team.abbreviation),
+          logo: away.team.logo
         }
       };
     });
 
-    const activeGameIds = games
-      .filter(g => g.status !== 'SCHEDULED')
-      .map(g => g.id);
-
+    const activeGames = games.filter(g => g.status !== 'SCHEDULED');
     let allPlayers: Player[] = [];
 
-    const playerPromises = activeGameIds.map(async (gameId) => {
-      try {
-        const summaryRes = await fetch(`${SUMMARY_URL}?event=${gameId}`);
-        if (!summaryRes.ok) return [];
-        const summaryData = await summaryRes.json();
-        const boxscore = summaryData.boxscore;
-        
-        if (!boxscore || !boxscore.players) return [];
-
-        const gamePlayers: Player[] = [];
-
-        boxscore.players.forEach((teamSection: any) => {
-          const teamAbbr = teamSection.team.abbreviation; 
-          
-          teamSection.statistics.forEach((p: any) => {
-             const statsMap: any = {};
-             const labels = p.names || p.labels || []; 
-             const values = p.stats || [];
-
-             labels.forEach((label: string, idx: number) => {
-               statsMap[label] = values[idx];
+    await Promise.all(activeGames.map(async (g) => {
+        try {
+          const sRes = await fetch(`${ESPN_SUMMARY_URL}?event=${g.id}`);
+          if (!sRes.ok) return;
+          const sData = await sRes.json();
+          const box = sData.boxscore;
+          if(box && box.players) {
+             box.players.forEach((team: any) => {
+                team.statistics.forEach((p: any) => {
+                   if(!p.stats) return;
+                   const minsStr = p.stats[0]; 
+                   const mins = parseMinutes(minsStr);
+                   if (mins > 0) {
+                      const statsArr = p.stats; 
+                      allPlayers.push({
+                        id: p.athlete.id,
+                        name: p.athlete.displayName,
+                        teamId: `t_${team.team.abbreviation}`,
+                        gameId: g.id,
+                        position: p.athlete.position?.abbreviation || 'F',
+                        avatar: p.athlete.headshot?.href || '',
+                        stats: {
+                          pts: parseInt(statsArr[13] || '0'), // PTS is usually last in ESPN array
+                          reb: parseInt(statsArr[6] || '0'),
+                          ast: parseInt(statsArr[7] || '0'),
+                          stl: parseInt(statsArr[8] || '0'),
+                          blk: parseInt(statsArr[9] || '0'),
+                          fgm: 0, 
+                          fga: 0,
+                          minutes: mins
+                        },
+                        averages: { pts: 0, reb: 0, ast: 0 }
+                      });
+                   }
+                });
              });
-
-             if (statsMap['MIN'] && statsMap['MIN'] !== "--" && statsMap['MIN'] !== "DNP") {
-               const pts = parseInt(statsMap['PTS'] || '0');
-               const reb = parseInt(statsMap['REB'] || '0');
-               const ast = parseInt(statsMap['AST'] || '0');
-               const threePtRaw = statsMap['3PT'] || '0-0';
-               const threePtMade = parseInt(threePtRaw.split('-')[0] || '0');
-
-               gamePlayers.push({
-                 id: p.athlete.id,
-                 name: p.athlete.displayName,
-                 teamId: `t_${teamAbbr}`,
-                 gameId: gameId, // Important: Link to game
-                 position: p.athlete.position?.abbreviation || 'P',
-                 avatar: p.athlete.headshot?.href || `https://ui-avatars.com/api/?name=${p.athlete.displayName.replace(' ', '+')}&background=random`,
-                 stats: { pts, reb, ast },
-                 averages: { 
-                   pts: threePtMade, 
-                   reb: 0, 
-                   ast: 0 
-                 }
-               });
-             }
-          });
-        });
-        return gamePlayers;
-      } catch (err) {
-        return [];
-      }
-    });
-
-    const results = await Promise.all(playerPromises);
-    results.forEach(pList => allPlayers = [...allPlayers, ...pList]);
-
+          }
+        } catch (e) {
+          console.warn("ESPN Boxscore fetch error", e);
+        }
+    }));
     return { games, players: allPlayers };
 
-  } catch (error: any) {
-    return { games: [], players: [], error: "Erro ao conectar com API da NBA/ESPN." };
+  } catch(e) {
+    console.error("ESPN Fallback Error", e);
+    return { games: [], players: [] };
   }
-};
+}
 
-export const simulateLiveUpdates = (games: Game[], players: Player[]) => ({ games, players });
-export const createInitialGames = () => [];
-export const createInitialPlayers = () => [];
+// --- MAIN EXPORT ---
+
+export const fetchLiveNbaData = async (apiKey?: string): Promise<{ games: Game[], players: Player[], error?: string }> => {
+  // 1. Try NBA CDN with Proxy
+  const cdnData = await fetchFromNbaCdn();
+  if (cdnData && (cdnData.games.length > 0 || cdnData.players.length > 0)) {
+    return cdnData;
+  }
+
+  // 2. Fallback to ESPN
+  const espnData = await fetchFromEspn();
+  if (espnData.games.length > 0) {
+    return espnData;
+  }
+
+  return { games: [], players: [], error: "Não foi possível carregar dados de nenhuma fonte." };
+};

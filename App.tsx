@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Trophy, Activity, Flame, RefreshCw, Loader2, AlertCircle, TrendingUp } from 'lucide-react';
+import { Activity, RefreshCw, Loader2, AlertCircle, Siren, Zap, TrendingUp, Flame, Target } from 'lucide-react';
 import { fetchLiveNbaData } from './services/mockNbaService';
 import { Game, Player, HotStat } from './types';
 import { VoiceAssistant } from './components/VoiceAssistant';
@@ -7,9 +7,8 @@ import { VoiceAssistant } from './components/VoiceAssistant';
 function App() {
   const [games, setGames] = useState<Game[]>([]);
   const [players, setPlayers] = useState<Player[]>([]);
-  const [hotStats, setHotStats] = useState<HotStat[]>([]);
+  const [anomalies, setAnomalies] = useState<HotStat[]>([]);
   const [loading, setLoading] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   const hasFetchedRef = useRef(false);
@@ -32,8 +31,7 @@ function App() {
       
       setGames(sortedGames);
       setPlayers(newPlayers);
-      calculateHotStats(newPlayers, newGames);
-      setLastUpdated(new Date());
+      detectAnomalies(newPlayers, newGames);
     }
 
     setLoading(false);
@@ -49,126 +47,166 @@ function App() {
   useEffect(() => {
     const interval = setInterval(() => {
       loadRealData();
-    }, 60000);
+    }, 45000); 
     return () => clearInterval(interval);
   }, [loadRealData]);
 
-
-  const calculateHotStats = (currentPlayers: Player[], currentGames: Game[]) => {
-    const hot: HotStat[] = [];
+  // --- ANOMALY DETECTION ENGINE 2.0 ---
+  const detectAnomalies = (currentPlayers: Player[], currentGames: Game[]) => {
+    const detected: HotStat[] = [];
     const gamesMap = new Map(currentGames.map(g => [g.id, g]));
-    
+
     currentPlayers.forEach(p => {
+      const m = p.stats.minutes;
+      // Skip if hasn't played meaningful minutes
+      if (m < 2) return; 
+
+      // Get Game Context for Projection
       const game = gamesMap.get(p.gameId);
-      if (!game) return;
+      // Calculate how much of the game has passed (0.0 to 1.0)
+      // Use a minimum of 5 minutes elapsed to avoid crazy multipliers at start of game
+      const gameElapsed = Math.max(game ? game.elapsedMinutes : 1, 5); 
+      const gameProgress = Math.min(gameElapsed / 48.0, 1.0);
 
-      const teamAbbr = p.teamId.startsWith('t_') ? p.teamId.substring(2) : 'NBA';
-      const threePtMade = p.averages.pts; // Transported 3PM
+      const pts = p.stats.pts;
+      const ast = p.stats.ast;
+      const reb = p.stats.reb;
+      const stl = p.stats.stl;
+      const blk = p.stats.blk;
+      const threePM = p.averages.pts; 
 
-      // PACE CALCULATION
-      // We project stats to 48 minutes to find "hotness" relative to game time.
-      // Filter out garbage time: only consider if game has at least 5 mins elapsed or it's finished.
-      const elapsed = Math.max(game.elapsedMinutes, 1);
-      const isEarlyGame = elapsed < 5;
-      const isFinished = game.status === 'FINISHED';
+      // --- PROJECTION HELPER ---
+      const getProj = (val: number) => Math.round(val / gameProgress);
 
-      // Projection Factor
-      // If Live: Project to 48m. If Finished: Factor is 1 (actual stats).
-      const projectionFactor = isFinished ? 1 : (48 / elapsed);
+      // Metric: Points Per Minute (PPM)
+      const ppm = pts / m;
 
-      const projPts = p.stats.pts * projectionFactor;
-      const projReb = p.stats.reb * projectionFactor;
-      const projAst = p.stats.ast * projectionFactor;
+      // --- DETECTION RULES ---
 
-      // --- LOGIC: THRESHOLDS FOR "HOT" ---
-      
-      // 1. Points
-      // Hot if: Current > 25 OR (Live & Projected > 30 & Current > 6)
-      // Note: "Current > 6" prevents someone with 2 pts in 1 min from being "Hot"
-      if (p.stats.pts >= 25) {
-         hot.push(createHotStat(p, teamAbbr, 'PTS', p.stats.pts, p.stats.pts, false));
-      } else if (!isFinished && !isEarlyGame && projPts >= 30 && p.stats.pts >= 6) {
-         hot.push(createHotStat(p, teamAbbr, 'PTS', p.stats.pts, Math.round(projPts), true));
+      // 1. THE "GUI SANTOS" RULE (Micro-ondas / Bench Spark)
+      if (m < 15 && m >= 2) {
+        if (ppm > 1.0 && pts >= 5) { 
+           detected.push(createAnomaly(p, 'PTS', pts, m, getProj(pts), 'Micro-ondas! Entrou pontuando muito.', 'HIGH'));
+        }
+        else if (threePM >= 2 && m < 8) {
+           detected.push(createAnomaly(p, '3PM', threePM, m, getProj(threePM), 'Gatilho rápido! 2+ bolas de 3.', 'HIGH'));
+        }
       }
 
-      // 2. Assists
-      // Hot if: Current > 8 OR (Live & Projected > 10 & Current > 3)
-      if (p.stats.ast >= 9) {
-         hot.push(createHotStat(p, teamAbbr, 'AST', p.stats.ast, p.stats.ast, false));
-      } else if (!isFinished && !isEarlyGame && projAst >= 12 && p.stats.ast >= 3) {
-         hot.push(createHotStat(p, teamAbbr, 'AST', p.stats.ast, Math.round(projAst), true));
+      // 2. THE "STAR" RULE (Volume & Consistency)
+      else {
+        if (pts >= 30) {
+          detected.push(createAnomaly(p, 'PTS', pts, m, getProj(pts), 'Volume de elite. Jogo de 30+ pontos.', 'EXTREME'));
+        } else if (ppm > 0.8 && pts >= 12) {
+          detected.push(createAnomaly(p, 'PTS', pts, m, getProj(pts), `Ritmo forte (${ppm.toFixed(1)} pts/min).`, 'HIGH'));
+        }
+        
+        if (ast >= 10) {
+          detected.push(createAnomaly(p, 'AST', ast, m, getProj(ast), 'Double-double em assistências.', 'HIGH'));
+        } else if (ast / m > 0.35 && ast >= 5) {
+           detected.push(createAnomaly(p, 'AST', ast, m, getProj(ast), 'Visão de jogo elite.', 'MEDIUM'));
+        }
+
+        if (reb >= 12) {
+          detected.push(createAnomaly(p, 'REB', reb, m, getProj(reb), 'Dominando a tábua.', 'HIGH'));
+        } else if (reb / m > 0.4 && reb >= 6) {
+           detected.push(createAnomaly(p, 'REB', reb, m, getProj(reb), 'Alta taxa de rebotes.', 'MEDIUM'));
+        }
+        
+        if (stl >= 4) {
+          detected.push(createAnomaly(p, 'STL', stl, m, getProj(stl), 'Mãos rápidas! 4+ roubos.', 'EXTREME'));
+        }
       }
 
-      // 3. Rebounds
-      // Hot if: Current > 10 OR (Live & Projected > 13 & Current > 4)
-      if (p.stats.reb >= 11) {
-         hot.push(createHotStat(p, teamAbbr, 'REB', p.stats.reb, p.stats.reb, false));
-      } else if (!isFinished && !isEarlyGame && projReb >= 14 && p.stats.reb >= 4) {
-         hot.push(createHotStat(p, teamAbbr, 'REB', p.stats.reb, Math.round(projReb), true));
+      // 3. SPECIALIST ALERTS (Any time)
+      if (threePM >= 5) {
+         detected.push(createAnomaly(p, '3PM', threePM, m, getProj(threePM), `Chuva de 3! ${threePM} convertidas.`, 'HIGH'));
       }
-
-      // 4. 3-Pointers (Always absolute, no projection needed usually)
-      if (threePtMade >= 4) {
-        hot.push({
-          playerId: p.id,
-          playerName: p.name,
-          teamAbbr: teamAbbr,
-          statType: 'PTS', // Color hack
-          current: p.stats.pts,
-          projected: threePtMade, // Hack: store 3PM count here
-          diff: 0,
-          percentage: 100,
-          isProjection: false // Special handling in UI
-        });
+      if (blk >= 4) {
+         detected.push(createAnomaly(p, 'BLK', blk, m, getProj(blk), 'Parede humana! 4+ tocos.', 'EXTREME'));
       }
     });
-    
-    // Sort by "Impressiveness" (Raw stats for finished, Projection for live)
-    setHotStats(hot.sort((a, b) => b.projected - a.projected).slice(0, 15));
+
+    // Remove duplicates (keep highest severity)
+    const uniqueMap = new Map<string, HotStat>();
+    detected.forEach(d => {
+      const key = d.playerId + d.statType;
+      if (!uniqueMap.has(key) || getSeverityVal(d.severity) > getSeverityVal(uniqueMap.get(key)!.severity)) {
+        uniqueMap.set(key, d);
+      }
+    });
+    const unique = Array.from(uniqueMap.values());
+
+    setAnomalies(unique.sort((a, b) => {
+      const sDiff = getSeverityVal(b.severity) - getSeverityVal(a.severity);
+      if (sDiff !== 0) return sDiff;
+      return b.value - a.value;
+    }));
   };
 
-  const createHotStat = (p: Player, team: string, type: 'PTS' | 'REB' | 'AST', curr: number, proj: number, isProj: boolean): HotStat => {
+  const getSeverityVal = (s: string) => {
+    if (s === 'EXTREME') return 4;
+    if (s === 'HIGH') return 3;
+    if (s === 'MEDIUM') return 2;
+    return 1;
+  };
+
+  const createAnomaly = (p: Player, type: any, val: number, minutes: number, proj: number, desc: string, severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME'): HotStat => {
+    const pace = (val / Math.max(minutes, 1)) * 36;
     return {
       playerId: p.id,
       playerName: p.name,
-      teamAbbr: team,
+      teamAbbr: p.teamId.replace('t_', ''),
       statType: type,
-      current: curr,
-      projected: proj,
-      diff: proj - curr,
-      percentage: Math.min((curr / (isProj ? proj/2 : 15)) * 100, 100), // Visual bar calculation
-      isProjection: isProj
+      value: val,
+      pace: pace,
+      projectedTotal: proj,
+      anomalyScore: getSeverityVal(severity) * 2.5,
+      severity,
+      description: desc,
+      minuteOfGame: Math.round(minutes)
     };
   };
 
+  const getSeverityColor = (sev: string) => {
+    switch (sev) {
+      case 'EXTREME': return 'bg-red-600 text-white shadow-red-500/50 border-red-400 ring-2 ring-red-400/20';
+      case 'HIGH': return 'bg-orange-500 text-white shadow-orange-500/50 border-orange-400';
+      case 'MEDIUM': return 'bg-yellow-500 text-black shadow-yellow-500/50 border-yellow-400';
+      default: return 'bg-blue-500 text-white border-blue-400';
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 pb-20">
-      <header className="bg-slate-900/95 backdrop-blur-sm sticky top-0 z-40 border-b border-slate-800">
+    <div className="min-h-screen bg-slate-950 text-slate-100 pb-20">
+      <header className="bg-slate-900/90 backdrop-blur-xl sticky top-0 z-40 border-b border-slate-800 shadow-2xl">
         <div className="max-w-7xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between flex-wrap gap-4">
-            <div className="flex items-center gap-2">
-              <div className="bg-indigo-600 p-2 rounded-lg">
-                <Activity className="w-6 h-6 text-white" />
+            <div className="flex items-center gap-3">
+              <div className="bg-gradient-to-br from-red-600 to-red-800 p-2.5 rounded-xl shadow-lg shadow-red-900/50 animate-pulse-slow border border-red-500/30">
+                <Siren className="w-6 h-6 text-white" />
               </div>
-              <h1 className="text-xl font-bold tracking-tight">NBA <span className="text-indigo-400">Live Pulse</span></h1>
+              <div>
+                <h1 className="text-2xl font-black tracking-tighter text-white uppercase italic">
+                  Operaçao<span className="text-transparent bg-clip-text bg-gradient-to-r from-red-500 to-orange-500">Remynba</span>
+                </h1>
+                <p className="text-[10px] font-mono uppercase tracking-widest text-slate-400">Scanner de Elite • Multi-Source</p>
+              </div>
             </div>
 
             <div className="flex items-center gap-4 text-sm text-slate-400">
-              {loading && <Loader2 className="w-4 h-4 animate-spin text-indigo-400"/>}
-              {!loading && lastUpdated && <span className="hidden md:inline text-xs text-slate-500">Atualizado: {lastUpdated.toLocaleTimeString()}</span>}
-
+              {loading && <div className="flex items-center gap-2 text-red-400 text-xs font-bold animate-pulse"><Loader2 className="w-3 h-3 animate-spin"/> SCANNING...</div>}
               <button 
                 onClick={() => loadRealData()}
                 disabled={loading}
-                className="p-2 bg-slate-800 hover:bg-slate-700 rounded-full transition-colors disabled:opacity-50"
-                title="Atualizar Dados Agora"
+                className="p-2.5 bg-slate-800 hover:bg-slate-700 rounded-full transition-all hover:scale-110 active:scale-95 border border-slate-700 shadow-lg"
               >
                 <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
               </button>
             </div>
           </div>
           {errorMsg && (
-            <div className="mt-4 bg-yellow-900/30 border border-yellow-700/50 rounded-lg p-3 flex items-center gap-3 text-yellow-200 text-sm">
+            <div className="mt-4 bg-red-950/50 border border-red-800/50 rounded-lg p-3 flex items-center gap-3 text-red-200 text-sm animate-in slide-in-from-top-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{errorMsg}</span>
             </div>
@@ -176,137 +214,125 @@ function App() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-8 space-y-8">
+      <main className="max-w-7xl mx-auto px-4 py-8 space-y-10">
         
-        {/* Games Scroll */}
+        {/* Games Strip */}
         <section>
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-slate-200 flex items-center gap-2">
-              Jogos Recentes & Ao Vivo
-            </h2>
-          </div>
-          
-          {games.length === 0 ? (
-             <div className="p-8 text-center text-slate-500 bg-slate-800/50 rounded-xl border border-dashed border-slate-700">
-               {loading ? "Buscando jogos..." : "Nenhum jogo encontrado nas últimas 24h."}
-             </div>
-          ) : (
-            <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-hide snap-x">
+          {games.length > 0 ? (
+            <div className="flex gap-4 overflow-x-auto pb-6 scrollbar-hide snap-x px-2">
               {games.map(game => (
-                <div key={game.id} className={`snap-center shrink-0 w-72 border rounded-xl p-4 shadow-lg transition-colors ${game.status === 'LIVE' ? 'bg-slate-800 border-red-900/50' : 'bg-slate-800 border-slate-700'}`}>
-                  <div className="flex justify-between items-center text-xs text-slate-400 mb-3">
-                    <span className={`font-mono px-2 py-0.5 rounded flex items-center gap-1 ${game.status === 'LIVE' ? 'bg-slate-900 text-red-400 border border-red-900' : 'bg-slate-900 text-slate-500'}`}>
-                      {game.status === 'LIVE' && <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>}
-                      {game.status === 'LIVE' ? `Q${game.quarter} ${game.timeLeft}` : game.status === 'FINISHED' ? 'FINAL' : 'AGENDADO'}
+                <div key={game.id} className={`snap-center shrink-0 w-72 rounded-2xl p-4 border transition-all relative overflow-hidden group ${game.status === 'LIVE' ? 'bg-gradient-to-br from-slate-900 to-slate-800 border-red-500/50 shadow-red-900/20 shadow-xl' : 'bg-slate-900 border-slate-800 opacity-60 hover:opacity-100'}`}>
+                  {game.status === 'LIVE' && <div className="absolute top-0 right-0 p-1.5"><div className="w-2 h-2 rounded-full bg-red-500 animate-ping"/></div>}
+                  
+                  <div className="flex justify-between items-center text-[11px] text-slate-400 mb-4 font-mono uppercase tracking-wider">
+                    <span className={game.status === 'LIVE' ? 'text-red-400 font-bold' : ''}>
+                      {game.status === 'LIVE' ? `AO VIVO • Q${game.quarter} ${game.timeLeft}` : game.status}
                     </span>
-                    <span>NBA</span>
                   </div>
-                  <div className="space-y-3">
-                    <div className="flex justify-between items-center">
-                      <div className="flex items-center gap-3">
-                        <img src={game.homeTeam.logo} alt="" className="w-6 h-6 object-contain opacity-80" onError={(e) => e.currentTarget.style.display = 'none'} />
-                        <span className={`font-bold text-lg w-12 truncate ${game.homeTeam.score > game.awayTeam.score ? 'text-white' : 'text-slate-400'}`}>
-                          {game.homeTeam.abbreviation}
-                        </span>
-                      </div>
-                      <span className={`text-2xl font-bold font-mono ${game.homeTeam.score > game.awayTeam.score ? 'text-white' : 'text-slate-500'}`}>
-                        {game.homeTeam.score}
-                      </span>
+                  
+                  <div className="flex justify-between items-center relative z-10">
+                    <div className="flex flex-col items-center w-1/3 gap-2">
+                       <img src={game.homeTeam.logo} alt={game.homeTeam.abbreviation} className="w-10 h-10 object-contain drop-shadow-lg" />
+                       <span className="font-bold text-xl">{game.homeTeam.score}</span>
                     </div>
-                    <div className="flex justify-between items-center">
-                       <div className="flex items-center gap-3">
-                        <img src={game.awayTeam.logo} alt="" className="w-6 h-6 object-contain opacity-80" onError={(e) => e.currentTarget.style.display = 'none'} />
-                        <span className={`font-bold text-lg w-12 truncate ${game.awayTeam.score > game.homeTeam.score ? 'text-white' : 'text-slate-400'}`}>
-                          {game.awayTeam.abbreviation}
-                        </span>
-                      </div>
-                      <span className={`text-2xl font-bold font-mono ${game.awayTeam.score > game.homeTeam.score ? 'text-white' : 'text-slate-500'}`}>
-                        {game.awayTeam.score}
-                      </span>
+                    <span className="text-slate-600 text-xs font-black">VS</span>
+                    <div className="flex flex-col items-center w-1/3 gap-2">
+                       <img src={game.awayTeam.logo} alt={game.awayTeam.abbreviation} className="w-10 h-10 object-contain drop-shadow-lg" />
+                       <span className="font-bold text-xl">{game.awayTeam.score}</span>
                     </div>
                   </div>
                 </div>
               ))}
             </div>
+          ) : (
+            <div className="text-center text-slate-500 py-4 text-sm font-mono">
+              Aguardando jogos...
+            </div>
           )}
         </section>
 
-        {/* Hot Players Grid */}
+        {/* Anomaly Grid */}
         <section>
-          <div className="flex items-center gap-2 mb-6">
-            <Flame className="w-6 h-6 text-orange-500" />
-            <h2 className="text-2xl font-bold text-white">Destaques Individuais</h2>
+          <div className="flex items-center gap-3 mb-8 pl-2 border-l-4 border-yellow-500">
+            <Flame className="w-7 h-7 text-yellow-500 fill-orange-500 animate-pulse" />
+            <h2 className="text-3xl font-black text-white uppercase italic tracking-tighter">Radar de Anomalias</h2>
           </div>
           
-          {loading && hotStats.length === 0 ? (
-            <div className="flex items-center justify-center py-20">
-               <Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
-            </div>
-          ) : hotStats.length === 0 ? (
-            <div className="text-center py-20 bg-slate-800/50 rounded-2xl border border-dashed border-slate-700">
-              <p className="text-slate-500">Nenhum destaque detectado ainda. (Critério: Ritmo de 30+ PTS, 12+ AST, ou 14+ REB)</p>
+          {anomalies.length === 0 ? (
+            <div className="text-center py-32 bg-slate-900/30 rounded-3xl border-2 border-dashed border-slate-800/50 flex flex-col items-center justify-center group">
+              <div className="p-6 bg-slate-900 rounded-full mb-6 group-hover:scale-110 transition-transform duration-500">
+                 <Activity className="w-16 h-16 text-slate-700 group-hover:text-red-500 transition-colors" />
+              </div>
+              <p className="text-slate-400 text-xl font-light">Nenhuma anomalia crítica detectada.</p>
+              <p className="text-slate-600 text-sm mt-2 max-w-md mx-auto">O algoritmo está monitorando cada posse de bola em busca de desempenhos fora da curva.</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {hotStats.map((stat, idx) => (
-                <div key={`${stat.playerId}-${stat.statType}-${idx}`} className="bg-slate-800 rounded-xl border border-slate-700 p-5 shadow-lg relative overflow-hidden group hover:border-indigo-500/50 transition-colors">
-                  <div className="absolute top-0 right-0 p-3 opacity-10 group-hover:opacity-20 transition-opacity">
-                    <Trophy className="w-24 h-24 text-indigo-500 transform rotate-12" />
-                  </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+              {anomalies.map((stat, idx) => (
+                <div key={`${stat.playerId}-${stat.statType}-${idx}`} className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden relative group hover:border-slate-600 hover:-translate-y-1 transition-all duration-300 shadow-2xl">
                   
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex items-center gap-3">
-                      <img 
-                        src={`https://a.espncdn.com/combiner/i?img=/i/headshots/nba/players/full/${stat.playerId}.png&w=350&h=254`} 
-                        alt={stat.playerName}
-                        className="w-12 h-12 rounded-full bg-slate-700 object-cover object-top border border-slate-600"
-                        onError={(e) => { e.currentTarget.src = `https://ui-avatars.com/api/?name=${stat.playerName}&background=random` }}
-                      />
-                      <div>
-                        <h3 className="text-lg font-bold text-white leading-tight">{stat.playerName}</h3>
-                        <span className="text-xs font-bold text-slate-400 bg-slate-900 px-2 py-1 rounded mt-1 inline-block">
+                  {/* Severity Banner */}
+                  <div className={`absolute top-0 right-0 px-4 py-1.5 rounded-bl-2xl text-[10px] font-black tracking-widest uppercase shadow-lg z-10 ${getSeverityColor(stat.severity)}`}>
+                    {stat.severity === 'EXTREME' ? 'CRÍTICO' : stat.severity === 'HIGH' ? 'ALTO' : 'MÉDIO'}
+                  </div>
+
+                  <div className="p-6 relative">
+                    <div className="absolute top-0 left-0 w-full h-24 bg-gradient-to-b from-slate-800/50 to-transparent pointer-events-none" />
+
+                    <div className="flex items-start gap-4 mb-5 relative z-10">
+                      <div className="relative shrink-0">
+                        <div className="w-16 h-16 rounded-2xl bg-slate-800 overflow-hidden border-2 border-slate-700 shadow-inner">
+                           <img 
+                            src={`https://cdn.nba.com/headshots/nba/latest/1040x760/${stat.playerId}.png`} 
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).src = `https://ui-avatars.com/api/?name=${stat.playerName}&background=random`
+                            }}
+                            alt={stat.playerName}
+                            className="w-full h-full object-cover scale-110 mt-2"
+                          />
+                        </div>
+                        <div className="absolute -bottom-2 -right-2 bg-black text-[10px] font-bold px-1.5 py-0.5 rounded border border-slate-700 text-slate-300">
                           {stat.teamAbbr}
-                        </span>
+                        </div>
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="text-lg font-bold text-white leading-tight truncate">{stat.playerName}</h3>
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className="px-2 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-slate-400 border border-slate-700">
+                             {stat.minuteOfGame} MIN
+                          </span>
+                        </div>
                       </div>
                     </div>
-                    <div className={`
-                      flex flex-col items-center justify-center w-12 h-12 rounded-full font-bold
-                      ${stat.statType === 'PTS' ? 'bg-orange-500/10 text-orange-400' : ''}
-                      ${stat.statType === 'REB' ? 'bg-blue-500/10 text-blue-400' : ''}
-                      ${stat.statType === 'AST' ? 'bg-green-500/10 text-green-400' : ''}
-                    `}>
-                      <span className="text-xs opacity-75">{stat.statType === 'PTS' && !stat.isProjection && stat.current === stat.projected && stat.current < 20 ? '3PM' : stat.statType}</span>
-                    </div>
-                  </div>
 
-                  <div className="flex items-end gap-2 mb-2">
-                    <span className="text-4xl font-bold text-white tracking-tighter">{stat.current}</span>
-                    {/* Special Case: 3PM or Finished Game */}
-                    {stat.statType === 'PTS' && !stat.isProjection && stat.current === stat.projected && stat.current < 20 && 
-                       <span className="text-xs text-orange-300 mb-2">Bolas de 3</span>
-                    }
-                  </div>
-                  
-                  {/* Projection Badge */}
-                  {stat.isProjection && (
-                    <div className="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-500/20 text-indigo-300 rounded text-xs font-medium mb-3">
-                      <TrendingUp className="w-3 h-3" />
-                      Projeção: {stat.projected} {stat.statType}
+                    {/* Stats Display */}
+                    <div className="flex flex-col mb-4">
+                      <div className="flex items-baseline gap-1">
+                         <span className={`text-5xl font-black tracking-tighter ${stat.severity === 'EXTREME' ? 'text-red-500' : 'text-white'}`}>
+                           {stat.value}
+                         </span>
+                         <span className="text-sm font-bold text-slate-500 uppercase">{stat.statType}</span>
+                      </div>
+                      <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Ao Vivo</span>
                     </div>
-                  )}
 
-                  <div className="w-full bg-slate-700/50 rounded-full h-2 mb-2 overflow-hidden">
-                    <div 
-                      className={`h-full rounded-full ${
-                        stat.percentage > 50 ? 'bg-gradient-to-r from-indigo-500 to-purple-500' : 'bg-indigo-500'
-                      }`}
-                      style={{ width: `${stat.percentage}%` }} 
-                    />
-                  </div>
-                  
-                  <div className="flex items-center text-xs font-medium text-green-400">
-                    <Activity className="w-3 h-3 mr-1" />
-                    {stat.isProjection ? 'Ritmo acelerado' : 'Performance de elite'}
+                    <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50 mb-3 backdrop-blur-sm min-h-[50px]">
+                      <p className="text-xs text-indigo-200 font-medium leading-relaxed">
+                        {stat.description}
+                      </p>
+                    </div>
+                    
+                    {/* FULL GAME PROJECTION */}
+                    <div className="pt-3 border-t border-slate-800/50">
+                      <div className="flex justify-between items-center group-hover:scale-105 transition-transform origin-left">
+                        <div className="flex items-center gap-2 text-yellow-500/80">
+                           <Target className="w-4 h-4" />
+                           <span className="text-[10px] uppercase font-black tracking-widest">Projeção Final</span>
+                        </div>
+                        <span className="text-2xl font-black font-mono text-yellow-400">{stat.projectedTotal}</span>
+                      </div>
+                    </div>
+
                   </div>
                 </div>
               ))}

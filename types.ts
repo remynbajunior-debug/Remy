@@ -9,6 +9,11 @@ export interface Player {
     pts: number;
     reb: number;
     ast: number;
+    stl: number; // Added steals
+    blk: number; // Added blocks
+    fgm: number; // Field Goals Made
+    fga: number; // Field Goals Attempted
+    minutes: number; // Precise minutes (float)
   };
   averages: {
     pts: number;
@@ -32,7 +37,7 @@ export interface Game {
   awayTeam: Team;
   quarter: number;
   timeLeft: string;
-  elapsedMinutes: number; // New field for pace calculation
+  elapsedMinutes: number;
   status: 'SCHEDULED' | 'LIVE' | 'FINISHED';
 }
 
@@ -45,10 +50,12 @@ export interface HotStat {
   playerId: string;
   playerName: string;
   teamAbbr: string;
-  statType: 'PTS' | 'REB' | 'AST';
-  current: number;
-  projected: number; // Changed 'average' to 'projected' for better context
-  diff: number; // Can be used for "On Pace" value
-  percentage: number;
-  isProjection: boolean; // Flag to show "On Pace" UI
+  statType: 'PTS' | 'REB' | 'AST' | '3PM' | 'EFF' | 'STL' | 'BLK';
+  value: number;
+  pace: number; // Per 36m pace (legacy/efficiency metric)
+  projectedTotal: number; // Linear projection for full 48m game
+  anomalyScore: number;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
+  description: string;
+  minuteOfGame: number;
 }
